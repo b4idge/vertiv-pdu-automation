@@ -1,0 +1,2 @@
+Vertiv PDU Management with Nornir and NetBox
+This project provides automated configuration and monitoring capabilities for Vertiv Power Distribution Units (PDUs) using Nornir for network automation and NetBox for inventory management.
