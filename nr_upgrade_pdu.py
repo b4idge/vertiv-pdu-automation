@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Vertiv PDU Firmware Upgrade Script
 
@@ -19,8 +20,6 @@ import sys
 import argparse
 import time
 from pathlib import Path
-from typing import Dict
-import logging
 from nornir import InitNornir
 from nornir.core.filter import F
 from nornir.core.task import Task, Result
@@ -32,11 +31,6 @@ from Vertiv import (
     nr_transfer_firmware,
     nr_get_firmware_version,
     nr_firmware_upgrade_workflow,
-    nr_connectivity_check,
-    nr_get_system_info,
-    nr_check_upgrade_success,
-    nr_wait_for_reboot,
-    nr_comprehensive_status_check,
     post_url
 )
 
@@ -66,7 +60,7 @@ def ensure_directories():
     Path(UPGRADE_LOG_DIR).mkdir(parents=True, exist_ok=True)
 
 
-def nr_backup_config(task: Task, headers: Dict[str, str]) -> Result:
+def nr_backup_config(task: Task) -> Result:
     """
     Backup PDU configuration before firmware upgrade
     """
@@ -102,7 +96,7 @@ def nr_backup_config(task: Task, headers: Dict[str, str]) -> Result:
         )
 
 
-def nr_validate_firmware_file(task: Task, headers: Dict[str, str], firmware_path: str) -> Result:
+def nr_validate_firmware_file(task: Task, firmware_path: str) -> Result:
     """
     Validate firmware file before upload
     """
@@ -123,7 +117,7 @@ def nr_validate_firmware_file(task: Task, headers: Dict[str, str], firmware_path
             )
         
         # Check file extension (common firmware extensions)
-        valid_extensions = ['.bin', '.img', '.fw', '.hex', '.firmware']
+        valid_extensions = ['.bin', '.img', '.fw', '.hex']
         file_ext = Path(firmware_path).suffix.lower()
         
         if file_ext not in valid_extensions:
@@ -147,7 +141,7 @@ def nr_validate_firmware_file(task: Task, headers: Dict[str, str], firmware_path
         )
 
 
-def nr_check_pdu_compatibility(task: Task, headers: Dict[str, str]) -> Result:
+def nr_check_pdu_compatibility(task: Task) -> Result:
     """
     Check PDU model and current version for compatibility
     """
@@ -194,7 +188,45 @@ def nr_check_pdu_compatibility(task: Task, headers: Dict[str, str]) -> Result:
             host=task.host,
             failed=True,
             result=f"Compatibility check failed: {str(e)}"
-        )(f"Attempt {attempt + 1} failed: {str(e)}")
+        )
+
+
+def nr_post_upgrade_verification(task: Task, expected_reboot_time: int = 300) -> Result:
+    """
+    Verify PDU comes back online after firmware upgrade and check new version
+    """
+    import requests
+    
+    print(f"Waiting {expected_reboot_time} seconds for {task.host} to reboot...")
+    time.sleep(expected_reboot_time)
+    
+    # Try to reconnect and verify new firmware
+    max_attempts = 10
+    retry_interval = 30
+    
+    for attempt in range(max_attempts):
+        try:
+            print(f"Verification attempt {attempt + 1}/{max_attempts} for {task.host}")
+            
+            # Try to get firmware version
+            version_result = task.run(
+                task=nr_get_firmware_version,
+                headers=headers
+            )
+            
+            if not version_result.failed:
+                return Result(
+                    host=task.host,
+                    result={
+                        'status': 'online',
+                        'new_firmware_version': version_result.result,
+                        'attempts': attempt + 1,
+                        'message': f"PDU came back online after {attempt + 1} attempts"
+                    }
+                )
+                
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {str(e)}")
         
         if attempt < max_attempts - 1:
             print(f"Retrying in {retry_interval} seconds...")
@@ -207,7 +239,7 @@ def nr_check_pdu_compatibility(task: Task, headers: Dict[str, str]) -> Result:
     )
 
 
-def firmware_upgrade_with_checks(task: Task, firmware_path: str, check_only: bool = False, expected_version: str = None) -> Result:
+def firmware_upgrade_with_checks(task: Task, firmware_path: str, check_only: bool = False) -> Result:
     """
     Complete firmware upgrade process with pre/post checks
     """
@@ -223,7 +255,6 @@ def firmware_upgrade_with_checks(task: Task, firmware_path: str, check_only: boo
         validation = task.run(
             name="Validate firmware file",
             task=nr_validate_firmware_file,
-            headers=headers,
             firmware_path=firmware_path
         )
         results.append(f"Firmware validation: {validation.result}")
@@ -234,8 +265,7 @@ def firmware_upgrade_with_checks(task: Task, firmware_path: str, check_only: boo
         # Step 2: Check compatibility
         compatibility = task.run(
             name="Check PDU compatibility",
-            task=nr_check_pdu_compatibility,
-            headers=headers
+            task=nr_check_pdu_compatibility
         )
         results.append(f"Compatibility check: {compatibility.result}")
         
@@ -251,8 +281,7 @@ def firmware_upgrade_with_checks(task: Task, firmware_path: str, check_only: boo
         if not check_only:
             backup = task.run(
                 name="Backup configuration",
-                task=nr_backup_config,
-                headers=headers
+                task=nr_backup_config
             )
             results.append(f"Configuration backup: {backup.result}")
             
@@ -288,31 +317,14 @@ def firmware_upgrade_with_checks(task: Task, firmware_path: str, check_only: boo
         # Step 5: Post-upgrade verification
         verification = task.run(
             name="Post-upgrade verification",
-            task=nr_wait_for_reboot,
-            headers=headers
+            task=nr_post_upgrade_verification
         )
         results.append(f"Post-upgrade verification: {verification.result}")
         
         if verification.failed:
             print(f"⚠️  Post-upgrade verification failed for {task.host}")
-            # Even if verification fails, try a final status check
-            final_check = task.run(
-                name="Final status check",
-                task=nr_comprehensive_status_check,
-                headers=headers,
-                expected_version=expected_version if 'expected_version' in locals() else None
-            )
-            results.append(f"Final status check: {final_check.result}")
         else:
             print(f"✅ {task.host} successfully upgraded and verified!")
-            # Run comprehensive status check for successful upgrades
-            final_check = task.run(
-                name="Final status check", 
-                task=nr_comprehensive_status_check,
-                headers=headers,
-                expected_version=expected_version if 'expected_version' in locals() else None
-            )
-            results.append(f"Final status check: {final_check.result}")
         
         return Result(
             host=task.host,
@@ -345,12 +357,6 @@ def main():
                        help='Target specific host (use Netbox device name)')
     parser.add_argument('--config', default="config.yaml",
                        help='Nornir configuration file (default: config.yaml)')
-    parser.add_argument('--expected-version', '-e',
-                       help='Expected firmware version for verification (e.g., "6.2.1")')
-    parser.add_argument('--reboot-wait', '-w', type=int, default=180,
-                       help='Wait time for PDU reboot after upgrade (default: 300 seconds)')
-    parser.add_argument('--status-check', '-s', action='store_true',
-                       help='Run comprehensive status check after upgrade')
     
     args = parser.parse_args()
     
@@ -365,17 +371,16 @@ def main():
     # Initialize Nornir
     try:
         nr = InitNornir(
-            inventory={
-                "plugin": "NetBoxInventory2",
-                "options": {
-                    "nb_url": os.getenv("NETBOX_URL"),
-                    "nb_token": os.getenv("NETBOX_API_TOKEN"),
-                    "ssl_verify": os.getenv("NB_SSL_VERIFY", "true").lower() == 'true',
-                    "group_file": "../inventory/groups.yaml",
-                    "defaults_file": "../inventory/defaults.yaml",
-                },
-            }
-        )
+                            inventory={
+                                "plugin": "NetBoxInventory2",
+                                "options": {
+                                    "nb_url": os.getenv("NETBOX_URL"),
+                                    "nb_token": os.getenv("NETBOX_API_TOKEN"),
+                                    "ssl_verify": os.getenv("NB_SSL_VERIFY", "true").lower() == 'true',
+                                    "group_file": "../inventory/groups.yaml",
+                                    "defaults_file": "../inventory/defaults.yaml"
+                                }
+                            })
     except Exception as e:
         print(f"ERROR: Failed to initialize Nornir: {e}")
         sys.exit(1)
@@ -396,12 +401,6 @@ def main():
     for host in nr.inventory.hosts:
         print(f"  - {host}")
     
-    if not args.check_only and args.expected_version:
-        print(f"Expected firmware version: {args.expected_version}")
-        print(f"Reboot wait time: {args.reboot_wait} seconds")
-        if args.status_check:
-            print("Comprehensive status check will be run after upgrade")
-    
     if not args.check_only:
         print(f"\n⚠️  FIRMWARE UPGRADE MODE")
         print(f"Firmware file: {args.firmware}")
@@ -416,8 +415,7 @@ def main():
     results = nr.run(
         task=firmware_upgrade_with_checks,
         firmware_path=args.firmware,
-        check_only=args.check_only,
-        expected_version=args.expected_version
+        check_only=args.check_only
     )
     
     # Print results
@@ -426,23 +424,6 @@ def main():
     print(f"{'='*80}")
     
     print_result(results)
-    
-    # Optional: Run additional status check if requested
-    if args.status_check and not args.check_only and successful_hosts:
-        print(f"\n{'='*80}")
-        print("RUNNING COMPREHENSIVE STATUS CHECK")
-        print(f"{'='*80}")
-        
-        # Filter to only successful hosts for status check
-        status_nr = nr.filter(lambda host: str(host) in [str(h) for h in successful_hosts])
-        
-        status_results = status_nr.run(
-            task=nr_comprehensive_status_check,
-            headers=headers,
-            expected_version=args.expected_version
-        )
-        
-        print_result(status_results)
     
     # Summary
     failed_hosts = [host for host, result in results.items() if result.failed]
